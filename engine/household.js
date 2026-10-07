@@ -15,6 +15,10 @@ const { PROFILE_KEYS, ACTIVITY_KEYS, GOAL_KEYS } = require("./requirements");
 const ROUND_G = 10;        // 采购克重取整步长
 const SAFETY_FACTOR = 1.1; // 采购安全余量
 
+/* 家庭分餐协作角色：家长确认份量；成员确认替换；采购负责人确认到货。
+   null / "any" 表示未指定角色（向后兼容，权限校验放行）。 */
+const MEMBER_ROLES = { parent: "家长", member: "成员", buyer: "采购负责人" };
+
 function round1(x) { return Math.round(x * 10) / 10; }
 function round2(x) { return Math.round(x * 100) / 100; }
 function roundUp(g) { return Math.max(ROUND_G, Math.ceil((g - 1e-9) / ROUND_G) * ROUND_G); }
@@ -26,13 +30,16 @@ function emptyHousehold() {
     weekly_budget: 175,
     members: [],
     next_member_id: 1,
-    shopping: [],           // {id, cycle, source:"menu"|"manual", food_id, grams, est_cost, assignee, status, arrived_grams, actual_cost}
+    shopping: [],           // {id, cycle, source:"menu"|"manual"|"family", food_id, grams, est_cost, assignee, status, arrived_grams, actual_cost, arrived_by}
     consumption: [],        // {id, cycle, food_id, grams, source:"plan"|"manual", day_index, member}
     stock_manual: {},       // 期初 / 盘库入库（非采购渠道）{food_id: grams}
     consumed_days: [],      // 当前周期已按配餐消耗的日序号
     week: null,             // 最近一次联动生成的周菜单 {cycle, params, plan}，cycle 为菜单所属采购周
+    family_plan: null,      // 家庭分餐协作菜单（按成员营养目标生成，行级份量 / 替换 / 到货 / 消耗可追溯）
     next_item_id: 1,
     next_log_id: 1,
+    next_line_id: 1,
+    next_event_id: 1,
   };
 }
 
@@ -53,6 +60,21 @@ function validateAllergens(list) {
   }
 }
 
+function sanitizeExclude(list) {
+  const out = [];
+  for (const id of list || []) {
+    if (!getFood(id)) throw new Error("未知食材：" + id);
+    if (!out.includes(id)) out.push(id);
+  }
+  return out;
+}
+
+function sanitizeRole(role) {
+  if (role == null || role === "" || role === "any") return null;
+  if (!MEMBER_ROLES[role]) throw new Error("未知成员角色：" + role);
+  return role;
+}
+
 function familyAllergens(members) {
   const set = new Set();
   for (const m of members || []) (m.allergens || []).forEach(a => set.add(a));
@@ -69,6 +91,8 @@ function addMember(state, input) {
     name,
     profile: sanitizeProfile(input.profile),
     allergens: [...new Set(input.allergens || [])],
+    role: sanitizeRole(input.role),
+    exclude: sanitizeExclude(input.exclude),
   };
   state.members.push(member);
   return member;
@@ -88,6 +112,8 @@ function updateMember(state, id, patch) {
     validateAllergens(patch.allergens);
     m.allergens = [...new Set(patch.allergens)];
   }
+  if (Object.prototype.hasOwnProperty.call(patch, "role")) m.role = sanitizeRole(patch.role);
+  if (patch.exclude) m.exclude = sanitizeExclude(patch.exclude);
   return m;
 }
 
@@ -192,8 +218,12 @@ function leastLoadedMember(state) {
   return [...state.members].sort((a, b) => (load[a.id] - load[b.id]) || (a.id - b.id))[0].id;
 }
 
-/* 根据周菜单（重新）生成菜单来源采购项；保留已有任务的负责人，库存与待买自动抵扣 */
-function buildShoppingList(state, week) {
+/* 根据周菜单（重新）生成菜单来源采购项；保留已有任务的负责人，库存与待买自动抵扣。
+   opts.source 指定来源标签（"menu" 单日视图周菜单 / "family" 家庭分餐菜单），
+   不同来源的任务互不清理，各自只跟踪自身来源的净需求。 */
+function buildShoppingList(state, week, opts) {
+  opts = opts || {};
+  const source = opts.source === "family" ? "family" : "menu";
   if (!week || !Array.isArray(week.days)) throw new Error("缺少周菜单");
   const avoid = new Set(familyAllergens(state.members));
   const on = stockOnHand(state);
@@ -204,12 +234,17 @@ function buildShoppingList(state, week) {
   }
 
   const cycItems = currentItems(state);
-  const pendingMenu = {};
+  const pendingSource = {};
   const pendingGrams = {};
   for (const it of cycItems) {
     if (it.status !== "pending") continue;
+    if (it.source === source && !pendingSource[it.food_id]) pendingSource[it.food_id] = it;
+  }
+  /* 待买抵扣只统计“外部任务”：本来源正在跟踪的旧任务即将被重建，不能抵扣自身 */
+  for (const it of cycItems) {
+    if (it.status !== "pending") continue;
+    if (pendingSource[it.food_id] === it) continue;
     pendingGrams[it.food_id] = (pendingGrams[it.food_id] || 0) + it.grams;
-    if (it.source === "menu" && !pendingMenu[it.food_id]) pendingMenu[it.food_id] = it;
   }
 
   const keep = new Set();
@@ -219,7 +254,7 @@ function buildShoppingList(state, week) {
     if ((f.allergens || []).some(a => avoid.has(a))) continue; // 双重保险：配餐已规避
     const target = roundUp(needGrams * SAFETY_FACTOR);
     const net = target - (on[foodId] || 0) - (pendingGrams[foodId] || 0);
-    const existing = pendingMenu[foodId];
+    const existing = pendingSource[foodId];
     if (net > 0) {
       const grams = roundUp(net);
       if (existing) {
@@ -231,7 +266,7 @@ function buildShoppingList(state, week) {
         const item = {
           id: state.next_item_id++,
           cycle: state.cycle_no,
-          source: "menu",
+          source,
           food_id: foodId,
           grams,
           est_cost: round2(costFor(f, grams)),
@@ -244,13 +279,13 @@ function buildShoppingList(state, week) {
         keep.add(item.id);
       }
     } else if (existing) {
-      /* 库存 / 待买已覆盖需求：移除该菜单任务（手动添加项不动） */
+      /* 库存 / 待买已覆盖需求：移除该来源任务（其他来源与手动添加项不动） */
       state.shopping = state.shopping.filter(x => x.id !== existing.id);
     }
   }
-  /* 菜单中已消失的食材：清理其菜单待买任务 */
+  /* 菜单中已消失的食材：清理本来源的待买任务 */
   for (const it of [...cycItems]) {
-    if (it.source === "menu" && it.status === "pending" && !keep.has(it.id) && need[it.food_id] == null) {
+    if (it.source === source && it.status === "pending" && !keep.has(it.id) && need[it.food_id] == null) {
       state.shopping = state.shopping.filter(x => x.id !== it.id);
     }
   }
@@ -316,6 +351,7 @@ function arriveItem(state, itemId, opts) {
   it.status = "arrived";
   it.arrived_grams = grams;
   it.actual_cost = round2((unitCost * grams) / 100);
+  if (opts.arrived_by != null) it.arrived_by = Number(opts.arrived_by);
   return it;
 }
 
@@ -490,9 +526,11 @@ function decorateItem(state, it) {
     ...it,
     name: f ? f.name : it.food_id,
     cat_label: f ? f.cat : "",
+    source_label: it.source === "family" ? "分餐" : it.source === "manual" ? "手动" : "周菜单",
     allergens: f ? [...f.allergens] : [],
     allergen_flag: f ? f.allergens.some(a => avoid.has(a)) : false,
     assignee_name: it.assignee != null ? (state.members.find(m => m.id === it.assignee) || {}).name : null,
+    arrived_by_name: it.arrived_by != null ? (state.members.find(m => m.id === it.arrived_by) || {}).name : null,
   };
 }
 
@@ -532,7 +570,7 @@ function householdView(state) {
 }
 
 module.exports = {
-  ROUND_G, SAFETY_FACTOR,
+  ROUND_G, SAFETY_FACTOR, MEMBER_ROLES,
   emptyHousehold, sanitizeProfile, familyAllergens,
   addMember, updateMember, removeMember,
   stockOnHand, inventoryValue, budgetSummary,

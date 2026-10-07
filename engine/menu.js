@@ -142,4 +142,4 @@ function weekPlan(params) {
 
 function round1(x) { return Math.round(x * 10) / 10; }
 
-module.exports = { weekPlan, DAY_NAMES, STAPLE_ROTATION, PROTEIN_KINDS };
+module.exports = { weekPlan, DAY_NAMES, STAPLE_ROTATION, PROTEIN_KINDS, buildDayPools };

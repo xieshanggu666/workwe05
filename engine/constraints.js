@@ -55,13 +55,35 @@ function poolOf(slot, dayPools, meal) {
     dinner_staple: "dinner_staple",
     lunch_protein: "lunch_protein",
     dinner_protein: "dinner_protein",
+    breakfast_dairy_egg: "dairy_egg",
+    lunch_dairy_egg: "dairy_egg",
+    dinner_dairy_egg: "dairy_egg",
     breakfast_fruit: "fruit",
+    lunch_fruit: "fruit",
+    dinner_fruit: "fruit",
+    breakfast_nut: "nut",
+    lunch_nut: "nut",
+    dinner_nut: "nut",
+    lunch_oil: "oil", dinner_oil: "oil", breakfast_oil: "oil",
     lunch_veg_a: "veg", lunch_veg_b: "veg",
     dinner_veg_a: "veg", dinner_veg_b: "veg",
   };
   const key = keyMap[meal + "_" + slot.role];
-  return (key && dayPools[key]) ? dayPools[key] : slot.pool;
+  if (key) {
+    /* 家庭分餐成员替换：__force 指定该槽位只能落指定食材（成员替换的确定性求解） */
+    if (dayPools.__force && dayPools.__force[key]) return dayPools.__force[key];
+    if (dayPools[key]) return dayPools[key];
+  }
+  return slot.pool;
 }
+
+/* 各餐模板槽位表（家庭分餐按槽位求解替换候选使用） */
+const SLOT_TABLE = {
+  breakfast: BREAKFAST_SLOTS,
+  lunch: LUNCH_SLOTS,
+  dinner: DINNER_SLOTS,
+  snack: [SNACK_SLOT],
+};
 
 function pick(slot, taken, excludeIds, dayPools, meal, params, stock) {
   const base = poolOf(slot, dayPools, meal);
@@ -74,6 +96,19 @@ function pick(slot, taken, excludeIds, dayPools, meal, params, stock) {
   const blocked = f => f.allergens.some(a => allergenSet.has(a))
     || (f.weekly_limit && (weeklyUsed[f.id] || 0) >= f.weekly_limit);
   if (blocked(first)) return null;
+  /* 强制槽位（成员替换）：尊重替换意图，不再被库存优先逻辑改选 */
+  const forceKeyMap = {
+    breakfast_staple: "breakfast_staple", lunch_staple: "lunch_staple", dinner_staple: "dinner_staple",
+    lunch_protein: "lunch_protein", dinner_protein: "dinner_protein",
+    breakfast_dairy_egg: "dairy_egg", lunch_dairy_egg: "dairy_egg", dinner_dairy_egg: "dairy_egg",
+    breakfast_fruit: "fruit", lunch_fruit: "fruit", dinner_fruit: "fruit",
+    breakfast_nut: "nut", lunch_nut: "nut", dinner_nut: "nut",
+    lunch_oil: "oil", dinner_oil: "oil", breakfast_oil: "oil",
+    lunch_veg_a: "veg", lunch_veg_b: "veg", dinner_veg_a: "veg", dinner_veg_b: "veg",
+  };
+  const fKey = forceKeyMap[meal + "_" + slot.role];
+  const forced = !!(dayPools && dayPools.__force && fKey && dayPools.__force[fKey]);
+  if (forced) return first;
   /* 库存优先：在“可通过过滤”的候选中，把在库食材提为首选（无在库余量时保持池序） */
   if (stock) {
     const usable = pool.map(getFood).filter(f => f && !blocked(f));
@@ -441,4 +476,4 @@ function roundTotals(t) {
   return out;
 }
 
-module.exports = { planDay, ratios, totalOf, purchaseState, adequacyOf, MEALS, MEAL_LABEL, K };
+module.exports = { planDay, ratios, totalOf, purchaseState, adequacyOf, MEALS, MEAL_LABEL, K, SLOT_TABLE };

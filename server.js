@@ -7,6 +7,7 @@ const { getRequirement, PROFILE_KEYS, ACTIVITY_KEYS, GOAL_KEYS } = require("./en
 const { planDay } = require("./engine/constraints");
 const { weekPlan, DAY_NAMES } = require("./engine/menu");
 const household = require("./engine/household");
+const family = require("./engine/family");
 
 const arg = process.argv.find(a => a.startsWith("--port="));
 const PORT = arg ? parseInt(arg.slice(7), 10) : parseInt(process.env.PORT || "8074", 10);
@@ -23,6 +24,15 @@ function loadState() {
       const base = household.emptyHousehold();
       const merged = Object.assign(base, obj);
       if (!Number.isInteger(merged.next_member_id)) merged.next_member_id = 1;
+      if (!Number.isInteger(merged.next_item_id)) merged.next_item_id = 1;
+      if (!Number.isInteger(merged.next_log_id)) merged.next_log_id = 1;
+      if (!Number.isInteger(merged.next_line_id)) merged.next_line_id = 1;
+      if (!Number.isInteger(merged.next_event_id)) merged.next_event_id = 1;
+      /* 旧成员档案补全分餐协作字段 */
+      for (const m of merged.members || []) {
+        if (!Array.isArray(m.exclude)) m.exclude = [];
+        if (!("role" in m)) m.role = null;
+      }
       return merged;
     }
   } catch (e) {
@@ -49,7 +59,9 @@ function saveState() {
 
 function hh(body) {
   saveState();
-  return household.householdView(state);
+  const view = household.householdView(state);
+  view.family = family.familyView(state);
+  return view;
 }
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -102,6 +114,7 @@ const server = http.createServer(async (req, res) => {
         units: foodsMod.NUTRIENT_UNIT,
         nutrient_labels: foodsMod.NUTRIENT_LABEL,
         nutrient_order: foodsMod.NUTRIENT_ORDER,
+        member_roles: household.MEMBER_ROLES,
       });
     }
     if (p === "/api/foods" && req.method === "GET") {
@@ -147,7 +160,9 @@ const server = http.createServer(async (req, res) => {
 
     /* ---------- 家庭采购与库存 ---------- */
     if (p === "/api/household" && req.method === "GET") {
-      return json(res, 200, household.householdView(state));
+      const view = household.householdView(state);
+      view.family = family.familyView(state);
+      return json(res, 200, view);
     }
     if (p === "/api/household/budget" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
@@ -228,6 +243,64 @@ const server = http.createServer(async (req, res) => {
     if (p === "/api/household/cycle" && req.method === "POST") {
       household.startNewCycle(state);
       return json(res, 200, hh());
+    }
+
+    /* ---------- 家庭分餐协作 ---------- */
+    /* 按成员营养目标生成可追溯分餐菜单，并同步采购净需求 / 预算 / 库存 / 过敏限制 */
+    if (p === "/api/family/build" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      family.buildFamilyPlan(state, body);
+      return json(res, 200, hh());
+    }
+    if (p === "/api/family" && req.method === "GET") {
+      return json(res, 200, family.familyView(state));
+    }
+    /* 家长调整某行份量（改后回退待确认） */
+    let fm;
+    if ((fm = p.match(/^\/api\/family\/lines\/(\d+)\/grams$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      family.setLineGrams(state, Number(fm[1]), body.grams, body.actor_id, body.note);
+      return json(res, 200, hh());
+    }
+    /* 家长确认份量：scope=all|day|member_day|line */
+    if (p === "/api/family/portions/confirm" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      family.confirmPortions(state, body, body.actor_id);
+      return json(res, 200, hh());
+    }
+    /* 成员查询本人分餐行的可替换食材 */
+    if ((fm = p.match(/^\/api\/family\/lines\/(\d+)\/substitutes$/)) && req.method === "GET") {
+      const q = url.searchParams.get("actor_id");
+      return json(res, 200, family.substituteOptions(state, Number(fm[1]), q == null ? null : Number(q)));
+    }
+    /* 成员确认替换（可指定 target_food_id，默认首选） */
+    if ((fm = p.match(/^\/api\/family\/lines\/(\d+)\/substitute$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      family.substituteLine(state, Number(fm[1]), body, body.actor_id);
+      return json(res, 200, hh());
+    }
+    /* 采购负责人确认分餐采购项到货（实际克重 / 实际单价，入库存并记预算） */
+    if ((fm = p.match(/^\/api\/family\/shopping\/(\d+)\/arrive$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      const actorId = body.actor_id;
+      delete body.actor_id;
+      family.arriveFamilyItem(state, Number(fm[1]), body, actorId);
+      return json(res, 200, hh());
+    }
+    /* 家长按日确认分餐消耗（全员份量确认 + 库存齐备后逐行扣减） */
+    if ((fm = p.match(/^\/api\/family\/days\/(\d+)\/consume$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      family.consumeFamilyDay(state, Number(fm[1]), body.actor_id);
+      return json(res, 200, hh());
+    }
+    /* 追溯：?member_id=&food_id=&day= */
+    if (p === "/api/family/trace" && req.method === "GET") {
+      const q = {
+        member_id: url.searchParams.get("member_id"),
+        food_id: url.searchParams.get("food_id"),
+        day: url.searchParams.get("day"),
+      };
+      return json(res, 200, family.familyTrace(state, q));
     }
 
     let f = p === "/" ? "/index.html" : p;
