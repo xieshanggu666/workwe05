@@ -19,6 +19,11 @@ function round1(x) { return Math.round(x * 10) / 10; }
 function round2(x) { return Math.round(x * 100) / 100; }
 function roundUp(g) { return Math.max(ROUND_G, Math.ceil((g - 1e-9) / ROUND_G) * ROUND_G); }
 
+/* 家庭协作角色：parent 家长（确认份量）、buyer 采购负责人（确认到货）；
+   两者皆可兼任，普通成员（成员）确认自己的替换。至少保留一名家长与一名采购负责人。 */
+const ROLES = ["parent", "buyer"];
+const ROLE_LABEL = { parent: "家长", buyer: "采购负责人", member: "成员" };
+
 function emptyHousehold() {
   return {
     version: 1,
@@ -26,11 +31,12 @@ function emptyHousehold() {
     weekly_budget: 175,
     members: [],
     next_member_id: 1,
-    shopping: [],           // {id, cycle, source:"menu"|"manual", food_id, grams, est_cost, assignee, status, arrived_grams, actual_cost}
-    consumption: [],        // {id, cycle, food_id, grams, source:"plan"|"manual", day_index, member}
+    shopping: [],           // {id, cycle, source:"menu"|"manual", food_id, grams, est_cost, assignee, status, arrived_grams, actual_cost, meal_ref?}
+    consumption: [],        // {id, cycle, food_id, grams, source:"plan"|"manual", day_index, member, meal_ref?}
     stock_manual: {},       // 期初 / 盘库入库（非采购渠道）{food_id: grams}
     consumed_days: [],      // 当前周期已按配餐消耗的日序号
     week: null,             // 最近一次联动生成的周菜单 {cycle, params, plan}，cycle 为菜单所属采购周
+    meal_plan: null,        // 家庭分餐协作菜单（见 mealplan.js）
     next_item_id: 1,
     next_log_id: 1,
   };
@@ -59,6 +65,19 @@ function familyAllergens(members) {
   return [...set];
 }
 
+function sanitizeRoles(list) {
+  const out = [...new Set(list || [])].filter(r => ROLES.includes(r));
+  return out;
+}
+
+function memberRoles(m) {
+  /* 无角色标记的普通成员；兼任家长 / 采购负责人时 roles 含对应值 */
+  return Array.isArray(m.roles) && m.roles.length ? m.roles : ["member"];
+}
+function hasRole(member, role) {
+  return Array.isArray(member.roles) && member.roles.includes(role);
+}
+
 function addMember(state, input) {
   const name = String((input && input.name) || "").trim();
   if (!name) throw new Error("成员名称不能为空");
@@ -69,6 +88,7 @@ function addMember(state, input) {
     name,
     profile: sanitizeProfile(input.profile),
     allergens: [...new Set(input.allergens || [])],
+    roles: sanitizeRoles(input.roles),
   };
   state.members.push(member);
   return member;
@@ -88,12 +108,34 @@ function updateMember(state, id, patch) {
     validateAllergens(patch.allergens);
     m.allergens = [...new Set(patch.allergens)];
   }
+  if (patch.roles) {
+    const next = sanitizeRoles(patch.roles);
+    assertRoleKept(state, id, next, "修改角色", m.roles);
+    m.roles = next;
+  }
   return m;
+}
+
+/* 角色完整性：角色体系一旦启用（家庭中已存在带角色成员），至少保留一名家长与一名采购负责人。
+   更新（成员尚未落盘）场景需传 selfCurrentRoles；删除场景先移除成员再调用或传空。
+   从"全员无角色"首次启用任何角色不受此约束。 */
+function assertRoleKept(state, memberId, nextRoles, action, selfCurrentRoles) {
+  const next = nextRoles || [];
+  const others = state.members.filter(m => m.id !== memberId);
+  const enabled = others.some(m => m.roles && m.roles.length) || (selfCurrentRoles || []).length > 0;
+  if (!enabled) return;
+  /* 其它成员持有该角色，或目标成员更新后仍持有该角色 */
+  const parentExists = others.some(m => hasRole(m, "parent")) || next.includes("parent");
+  const buyerExists = others.some(m => hasRole(m, "buyer")) || next.includes("buyer");
+  if (!parentExists) throw new Error(`至少保留一名家长后才能${action}`);
+  if (!buyerExists) throw new Error(`至少保留一名采购负责人后才能${action}`);
 }
 
 function removeMember(state, id) {
   const idx = state.members.findIndex(x => x.id === id);
   if (idx < 0) throw new Error("成员不存在");
+  /* 删除场景：该成员更新后不再持任何角色 */
+  assertRoleKept(state, id, [], "删除该成员");
   state.members.splice(idx, 1);
   /* 该成员名下采购任务改为未分配，任务本身保留 */
   for (const it of state.shopping) if (it.assignee === id) it.assignee = null;
@@ -192,69 +234,72 @@ function leastLoadedMember(state) {
   return [...state.members].sort((a, b) => (load[a.id] - load[b.id]) || (a.id - b.id))[0].id;
 }
 
-/* 根据周菜单（重新）生成菜单来源采购项；保留已有任务的负责人，库存与待买自动抵扣 */
-function buildShoppingList(state, week) {
-  if (!week || !Array.isArray(week.days)) throw new Error("缺少周菜单");
+/* 根据显式净需求（{food_id: 毛重克}）（重新）生成菜单来源采购项；
+   库存与非菜单待买（手动项等）自动抵扣。供周菜单与分餐协作菜单共用。
+   幂等：重建前摘除本周期旧的"菜单来源"待买（其克重已含 10% 安全余量，
+   重复抵扣会把自身抵没），保留手动项；已到货项一律保留。负责人按食材沿用。 */
+function buildShoppingFromNeeds(state, needRaw) {
   const avoid = new Set(familyAllergens(state.members));
   const on = stockOnHand(state);
 
+  /* 记录旧菜单待买的负责人，重建同食材任务时沿用，保证改派与负载分工稳定 */
+  const oldAssignee = {};
+  for (const it of currentItems(state)) {
+    if (it.source === "menu" && it.status === "pending" && oldAssignee[it.food_id] == null) {
+      oldAssignee[it.food_id] = it.assignee;
+    }
+  }
+  /* 摘除旧菜单待买（已到货的不动） */
+  state.shopping = state.shopping.filter(it =>
+    !(it.cycle === state.cycle_no && it.source === "menu" && it.status === "pending"));
+
   const need = {};
-  for (const day of week.days) {
-    for (const it of day.items) need[it.food_id] = (need[it.food_id] || 0) + it.grams;
+  for (const [foodId, g] of Object.entries(needRaw || {})) {
+    if (Number(g) > 0) need[foodId] = (need[foodId] || 0) + Number(g);
   }
 
-  const cycItems = currentItems(state);
-  const pendingMenu = {};
+  /* 剩余待买（手动项 / 结转项）合计，参与净需求抵扣 */
   const pendingGrams = {};
-  for (const it of cycItems) {
-    if (it.status !== "pending") continue;
-    pendingGrams[it.food_id] = (pendingGrams[it.food_id] || 0) + it.grams;
-    if (it.source === "menu" && !pendingMenu[it.food_id]) pendingMenu[it.food_id] = it;
+  for (const it of currentItems(state)) {
+    if (it.status === "pending") pendingGrams[it.food_id] = (pendingGrams[it.food_id] || 0) + it.grams;
   }
 
-  const keep = new Set();
   for (const [foodId, needGrams] of Object.entries(need)) {
     const f = getFood(foodId);
     if (!f) continue;
     if ((f.allergens || []).some(a => avoid.has(a))) continue; // 双重保险：配餐已规避
     const target = roundUp(needGrams * SAFETY_FACTOR);
+    /* 净缺口 = 目标 - 在库 - 其它渠道待买（手动项） */
     const net = target - (on[foodId] || 0) - (pendingGrams[foodId] || 0);
-    const existing = pendingMenu[foodId];
     if (net > 0) {
       const grams = roundUp(net);
-      if (existing) {
-        existing.grams = grams;
-        existing.est_cost = round2(costFor(f, grams));
-        keep.add(existing.id);
-      } else {
-        const assignee = leastLoadedMember(state);
-        const item = {
-          id: state.next_item_id++,
-          cycle: state.cycle_no,
-          source: "menu",
-          food_id: foodId,
-          grams,
-          est_cost: round2(costFor(f, grams)),
-          assignee,
-          status: "pending",
-          arrived_grams: 0,
-          actual_cost: 0,
-        };
-        state.shopping.push(item);
-        keep.add(item.id);
-      }
-    } else if (existing) {
-      /* 库存 / 待买已覆盖需求：移除该菜单任务（手动添加项不动） */
-      state.shopping = state.shopping.filter(x => x.id !== existing.id);
+      const kept = oldAssignee[foodId];
+      const assignee = kept != null && state.members.some(m => m.id === kept) ? kept : leastLoadedMember(state);
+      state.shopping.push({
+        id: state.next_item_id++,
+        cycle: state.cycle_no,
+        source: "menu",
+        food_id: foodId,
+        grams,
+        est_cost: round2(costFor(f, grams)),
+        assignee,
+        status: "pending",
+        arrived_grams: 0,
+        actual_cost: 0,
+      });
     }
   }
-  /* 菜单中已消失的食材：清理其菜单待买任务 */
-  for (const it of [...cycItems]) {
-    if (it.source === "menu" && it.status === "pending" && !keep.has(it.id) && need[it.food_id] == null) {
-      state.shopping = state.shopping.filter(x => x.id !== it.id);
-    }
+  return currentItems(state);
+}
+
+/* 根据周菜单（重新）生成菜单来源采购项；保留已有任务的负责人，库存与待买自动抵扣 */
+function buildShoppingList(state, week) {
+  if (!week || !Array.isArray(week.days)) throw new Error("缺少周菜单");
+  const need = {};
+  for (const day of week.days) {
+    for (const it of day.items) need[it.food_id] = (need[it.food_id] || 0) + it.grams;
   }
-  return state.shopping.filter(i => i.cycle === state.cycle_no);
+  return buildShoppingFromNeeds(state, need);
 }
 
 function addManualItem(state, input) {
@@ -321,6 +366,41 @@ function arriveItem(state, itemId, opts) {
 
 /* ---------------- 消耗 ---------------- */
 
+/* 按显式条目批量消耗：[{food_id, grams, member, meal_ref, day_index}]，
+   先整体校验库存（任一项不足则全部不入账），再逐条扣减。供分餐协作按成员入账。 */
+function consumeEntries(state, entries) {
+  const need = {};
+  for (const e of entries || []) {
+    const g = Math.round(Number(e.grams) * 10) / 10;
+    if (!(g > 0)) throw new Error("消耗克重必须为正数");
+    assertFood(e.food_id);
+    need[e.food_id] = (need[e.food_id] || 0) + g;
+  }
+  const on = stockOnHand(state);
+  const deficits = [];
+  for (const [id, g] of Object.entries(need)) {
+    if ((on[id] || 0) + 1e-6 < g) {
+      const f = getFood(id);
+      deficits.push({ food_id: id, name: f ? f.name : id, have: on[id] || 0, need: g, short: round1(g - (on[id] || 0)) });
+    }
+  }
+  if (deficits.length) {
+    const err = new Error("库存不足，请先确认采购到货：" + deficits.map(d => `${d.name}缺${d.short}g`).join("；"));
+    err.code = "INSUFFICIENT_STOCK";
+    err.deficits = deficits;
+    throw err;
+  }
+  const logs = [];
+  for (const e of entries || []) {
+    logs.push(consume(state, {
+      food_id: e.food_id, grams: e.grams, source: e.source || "plan",
+      day_index: Number.isInteger(e.day_index) ? e.day_index : null,
+      member: e.member, meal_ref: e.meal_ref,
+    }));
+  }
+  return logs;
+}
+
 function consume(state, input) {
   const f = assertFood(input.food_id);
   const grams = Math.round(Number(input.grams) * 10) / 10;
@@ -340,6 +420,7 @@ function consume(state, input) {
     source: input.source === "plan" ? "plan" : "manual",
     day_index: Number.isInteger(input.day_index) ? input.day_index : null,
     member: input.member || null,
+    meal_ref: input.meal_ref || null,
   };
   state.consumption.push(log);
   return log;
@@ -416,6 +497,8 @@ function startNewCycle(state) {
   /* 消耗日序按周期重新计数；历史消耗记录保留原周期标签（库存核算与追溯不受影响），
      旧周菜单因 cycle 标签过期自动失效，不可在新周期重复入账 */
   state.consumed_days = [];
+  /* 分餐协作菜单同样随周期失效：旧菜单保留可追溯，新周期需重新生成 */
+  if (state.meal_plan) state.meal_plan.consumed_days = [];
 }
 
 /* 本周各食材已消耗次数（含按配餐与手动消耗），供周限次约束使用 */
@@ -532,11 +615,13 @@ function householdView(state) {
 }
 
 module.exports = {
-  ROUND_G, SAFETY_FACTOR,
-  emptyHousehold, sanitizeProfile, familyAllergens,
+  ROUND_G, SAFETY_FACTOR, ROLES, ROLE_LABEL,
+  emptyHousehold, sanitizeProfile, sanitizeRoles, familyAllergens,
+  memberRoles, hasRole, assertRoleKept,
   addMember, updateMember, removeMember,
   stockOnHand, inventoryValue, budgetSummary,
-  buildShoppingList, addManualItem, assignItem, removeItem, arriveItem,
-  consume, consumeDay, setManualStock, setWeek, startNewCycle,
+  buildShoppingList, buildShoppingFromNeeds,
+  addManualItem, assignItem, removeItem, arriveItem,
+  consume, consumeEntries, consumeDay, setManualStock, setWeek, startNewCycle,
   weeklyUsed, syncInputs, warnings, householdView, weekIsCurrent,
 };

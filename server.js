@@ -7,6 +7,7 @@ const { getRequirement, PROFILE_KEYS, ACTIVITY_KEYS, GOAL_KEYS } = require("./en
 const { planDay } = require("./engine/constraints");
 const { weekPlan, DAY_NAMES } = require("./engine/menu");
 const household = require("./engine/household");
+const mealplan = require("./engine/mealplan");
 
 const arg = process.argv.find(a => a.startsWith("--port="));
 const PORT = arg ? parseInt(arg.slice(7), 10) : parseInt(process.env.PORT || "8074", 10);
@@ -49,7 +50,9 @@ function saveState() {
 
 function hh(body) {
   saveState();
-  return household.householdView(state);
+  const view = household.householdView(state);
+  view.meal = mealplan.mealView(state);
+  return view;
 }
 const MIME = {
   ".html": "text/html; charset=utf-8",
@@ -99,6 +102,7 @@ const server = http.createServer(async (req, res) => {
         goals: GOAL_KEYS,
         allergens: foodsMod.ALLERGENS,
         categories: foodsMod.CATEGORY_LABEL,
+        roles: household.ROLE_LABEL,
         units: foodsMod.NUTRIENT_UNIT,
         nutrient_labels: foodsMod.NUTRIENT_LABEL,
         nutrient_order: foodsMod.NUTRIENT_ORDER,
@@ -147,7 +151,9 @@ const server = http.createServer(async (req, res) => {
 
     /* ---------- 家庭采购与库存 ---------- */
     if (p === "/api/household" && req.method === "GET") {
-      return json(res, 200, household.householdView(state));
+      const view = household.householdView(state);
+      view.meal = mealplan.mealView(state);
+      return json(res, 200, view);
     }
     if (p === "/api/household/budget" && req.method === "POST") {
       const body = JSON.parse(await readBody(req));
@@ -227,6 +233,53 @@ const server = http.createServer(async (req, res) => {
     }
     if (p === "/api/household/cycle" && req.method === "POST") {
       household.startNewCycle(state);
+      return json(res, 200, hh());
+    }
+
+    /* ---------- 家庭分餐协作 ---------- */
+    /* 按成员营养目标生成可追溯分餐菜单，并同步采购净需求 / 预算 / 库存 / 过敏限制 */
+    if (p === "/api/household/meal/build" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      mealplan.buildMealPlan(state, { exclude: body.exclude || [], daily_budget: body.daily_budget });
+      const mp = state.meal_plan;
+      mealplan.syncShopping(state, mp);
+      /* 分餐菜单同时作为本采购周的联动菜单（旧的按配餐消耗仍可追溯） */
+      household.setWeek(state, mp.params, mp.plan);
+      return json(res, 200, hh());
+    }
+    /* 家长确认份量（可携带 adjustments 微调克重） */
+    if (p === "/api/household/meal/portions" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      mealplan.confirmPortions(state, Number(body.actor), { member_id: body.member_id, adjustments: body.adjustments || [] });
+      return json(res, 200, hh());
+    }
+    /* 某道菜品某位成员的同类替换候选（库存优先、含净采购成本） */
+    if ((mm = p.match(/^\/api\/household\/meal\/dishes\/(\d+)\/candidates$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      const mp = mealplan.mealView(state) ? state.meal_plan : null;
+      const dish = state.meal_plan.dishes.find(d => d.id === Number(mm[1]));
+      if (!dish) return json(res, 400, { error: "菜品不存在" });
+      const memberId = body.member_id != null ? Number(body.member_id) : Number(body.actor);
+      return json(res, 200, { candidates: mealplan.substitutionCandidates(state, state.meal_plan, dish, memberId) });
+    }
+    /* 成员确认替换（accept / 替换为 food_id） */
+    if (p === "/api/household/meal/substitutions" && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      mealplan.confirmSubstitution(state, Number(body.actor), {
+        dish_id: Number(body.dish_id), member_id: body.member_id != null ? Number(body.member_id) : null,
+        food_id: body.food_id || null, grams: body.grams,
+      });
+      return json(res, 200, hh());
+    }
+    /* 采购负责人在分餐工作流中确认到货 */
+    if ((mm = p.match(/^\/api\/household\/meal\/shopping\/(\d+)\/arrive$/)) && req.method === "POST") {
+      const body = JSON.parse(await readBody(req));
+      mealplan.arriveForMeal(state, Number(body.actor), Number(mm[1]), body);
+      return json(res, 200, hh());
+    }
+    /* 按天分餐消耗：按成员份量逐条入账并扣库存（可追溯到菜品与成员） */
+    if ((mm = p.match(/^\/api\/household\/meal\/consume\/day\/(\d+)$/)) && req.method === "POST") {
+      mealplan.consumeMealDay(state, Number(mm[1]));
       return json(res, 200, hh());
     }
 
